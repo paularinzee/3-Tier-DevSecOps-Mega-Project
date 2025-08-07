@@ -1,0 +1,136 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - deploy-to-dev-k8
+  pull_request:
+    branches:
+      - deploy-to-dev-k8
+
+jobs:
+  build-scan-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Needed for Gitleaks and other comprehensive scans
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '23.x'
+      
+      - name: Frontend Compilation (Syntax Check)
+        run: |
+          cd client
+          find . -name "*.js" -exec node --check {} +
+      
+      - name: Backend Compilation (Syntax Check)
+        run: |
+          cd api
+          find . -name "*.js" -exec node --check {} +
+
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          source: '.'
+          exit-code: 1
+      
+      - name: SonarQube Analysis
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectName=NodeJS-Project
+            -Dsonar.projectKey=NodeJS-Project
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+      
+      - name: SonarQube Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        with:
+          pollingTimeoutSec: 300
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          format: 'table'
+          output: 'trivy-fs-report.html'
+          exit-code: '1'
+
+      # Docker Build and Push Stages
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build, Scan, Tag, and Push Backend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
+      
+      - name: Trivy Image Scan (Backend)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/backend:latest'
+          format: 'table'
+          output: 'backend-image-report.html'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Build, Scan, Tag, and Push Frontend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./client
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+
+      - name: Trivy Image Scan (Frontend)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest'
+          format: 'table'
+          output: 'frontend-image-report.html'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+      
+      # Kubernetes Deployment Stages
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon EKS
+        uses: aws-actions/aws-eks-login@v2
+        with:
+          cluster-name: devopsshack-cluster
+          role-to-assume: ${{ secrets.EKS_ROLE_ARN }}
+      
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/sc.yaml -n dev
+          kubectl apply -f k8s/mysql.yaml -n dev
+          kubectl apply -f k8s/backend.yaml -n dev
+          kubectl apply -f k8s/frontend.yaml -n dev
+          sleep 30
+      
+      - name: Verify Kubernetes Deployment
+        run: |
+          kubectl get pods -n dev
+          kubectl get svc -n dev
