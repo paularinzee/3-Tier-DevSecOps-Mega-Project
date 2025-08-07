@@ -1,0 +1,92 @@
+name: DevSecOps 3-Tier Pipeline
+
+on:
+  push:
+    branches:
+      - docker-build-deploy
+  pull_request:
+    branches:
+      - docker-build-deploy
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Git Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '23'
+
+      - name: Frontend Compilation Check
+        run: |
+          cd client
+          find . -name "*.js" -exec node --check {} +
+        
+      - name: Backend Compilation Check
+        run: |
+          cd api
+          find . -name "*.js" -exec node --check {} +
+
+      - name: GitLeaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config_path: .gitleaks.toml
+          
+      - name: SonarQube Analysis
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.projectName=NodeJS-Project
+            -Dsonar.projectKey=NodeJS-Project
+            -Dsonar.sources=./client,./api
+
+      - name: Wait for SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          output: 'fs-report.html'
+          
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build, Trivy Scan, and Push Backend Docker Image
+        id: backend-docker
+        working-directory: ./api
+        run: |
+          docker build -t paularinzee/backend:latest .
+          trivy image --format table -o backend-image-report.html  paularinzee/backend:latest
+          docker push  paularinzee/backend:latest
+
+      - name: Build, Trivy Scan, and Push Frontend Docker Image
+        id: frontend-docker
+        working-directory: ./client
+        run: |
+          docker build -t  paularinzee/frontend:latest .
+          trivy image --format table -o frontend-image-report.html  paularinzee/frontend:latest
+          docker push  paularinzee/frontend:latest
+
+    
